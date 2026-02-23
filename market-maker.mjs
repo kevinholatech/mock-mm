@@ -39,6 +39,7 @@ const SYMBOL = process.env.SYMBOL ?? "BTC-USDC";
 const PRODUCT_ID = process.env.PRODUCT_ID ?? "2";
 const SPREAD = parseFloat(process.env.SPREAD ?? "0.001");
 const QUANTITY = process.env.QUANTITY ?? "0.01";
+const LEVELS = parseInt(process.env.LEVELS ?? "5", 10);  // order book depth levels per side
 const INTERVAL_MS = parseInt(process.env.INTERVAL_MS ?? "30000", 10);
 const MAX_ERRORS = parseInt(process.env.MAX_ERRORS ?? "5", 10);
 
@@ -105,8 +106,8 @@ async function api(path, opts = {}) {
     return fetch(`${BACKEND_URL}${path}`, opts);
 }
 
-async function placeOrder(side, type, timeInForce, price) {
-    const params = { productId: PRODUCT_ID, quantity: QUANTITY, side, symbol: BACKEND_SYMBOL, type };
+async function placeOrder(side, type, timeInForce, price, qty = QUANTITY) {
+    const params = { productId: PRODUCT_ID, quantity: qty, side, symbol: BACKEND_SYMBOL, type };
     if (timeInForce) params.timeInForce = timeInForce;
     if (price) params.price = price;
     const body = signedBody(params);
@@ -163,17 +164,23 @@ async function cycle() {
         });
         console.log(cancelRes.ok ? "done" : `skipped (${cancelRes.status})`);
 
-        // 3. Post-only BID
-        const bid = (markPrice * (1 - SPREAD)).toFixed(2);
-        process.stdout.write(`  3. BID @ ${bid} (GTC)... `);
-        await placeOrder("BUY", "LIMIT", "GTC", bid);
-        console.log("placed");
+        // 3. BID levels (5 levels: mark × (1 - spread×i))
+        for (let i = 1; i <= LEVELS; i++) {
+            const bid = (markPrice * (1 - SPREAD * i)).toFixed(2);
+            const qty = (parseFloat(QUANTITY) * (1 + (i - 1) * 0.5)).toFixed(4); // deeper = more qty
+            process.stdout.write(`  BID[${i}] @ ${bid} qty:${qty}... `);
+            await placeOrder("BUY", "LIMIT", "GTC", bid, qty);
+            console.log("placed");
+        }
 
-        // 4. Post-only ASK
-        const ask = (markPrice * (1 + SPREAD)).toFixed(2);
-        process.stdout.write(`  4. ASK @ ${ask} (GTC)... `);
-        await placeOrder("SELL", "LIMIT", "GTC", ask);
-        console.log("placed");
+        // 4. ASK levels (5 levels: mark × (1 + spread×i))
+        for (let i = 1; i <= LEVELS; i++) {
+            const ask = (markPrice * (1 + SPREAD * i)).toFixed(2);
+            const qty = (parseFloat(QUANTITY) * (1 + (i - 1) * 0.5)).toFixed(4);
+            process.stdout.write(`  ASK[${i}] @ ${ask} qty:${qty}... `);
+            await placeOrder("SELL", "LIMIT", "GTC", ask, qty);
+            console.log("placed");
+        }
 
         // 5. Match: limit BUY @ mark price (GTC — will cross)
         const mp = markPrice.toFixed(2);
