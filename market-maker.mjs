@@ -130,13 +130,17 @@ async function placeOrder(side, type, timeInForce, price, qty = QUANTITY) {
 }
 
 // ─── Telegram alert ──────────────────────────────────────────
+function nowStr() {
+    return new Date().toLocaleString("vi-VN", { timeZone: "Asia/Ho_Chi_Minh", hour12: false });
+}
+
 async function sendTelegram(msg) {
     if (!TG_TOKEN || !TG_CHAT_ID) return;
     try {
         await fetch(`https://api.telegram.org/bot${TG_TOKEN}/sendMessage`, {
             method: "POST",
             headers: { "Content-Type": "application/json" },
-            body: JSON.stringify({ chat_id: TG_CHAT_ID, text: `[Market Maker] ${msg}` }),
+            body: JSON.stringify({ chat_id: TG_CHAT_ID, text: `[Market Maker] ${nowStr()}\n${msg}` }),
         });
     } catch { /* ignore Telegram errors */ }
 }
@@ -147,7 +151,8 @@ let consecutiveErrors = 0;
 
 async function cycle() {
     cycleCount++;
-    console.log(`\n[Cycle #${cycleCount}] ${new Date().toISOString()}`);
+    const timeStr = new Date().toLocaleString("vi-VN", { timeZone: "Asia/Ho_Chi_Minh", hour12: false });
+    console.log(`\n[Cycle #${cycleCount}] ${timeStr}`);
     try {
         // 1. Mark price — from Binance Futures API (real market price)
         //    Backend testnet returns hardcoded 100000, not real price
