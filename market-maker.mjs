@@ -159,6 +159,7 @@ PAIRS.forEach(p => pairStates[p.symbol] = { consecutiveErrors: 0 });
 async function cycleForPair(pair) {
     const { backend, binance } = getSymbols(pair.symbol);
     const state = pairStates[pair.symbol];
+    if (state.disabled) return;
 
     try {
         let markPrice;
@@ -232,8 +233,7 @@ async function cycleForPair(pair) {
             const fatal = `[${pair.symbol}] Stopping after ${MAX_ERRORS} errors. Last: ${err.message}`;
             console.error(`\n❌ ${fatal}`);
             await sendTelegram(`🛑 ${fatal}`);
-            clearInterval(timer);
-            process.exit(1);
+            state.disabled = true;
         }
     }
 }
