@@ -118,6 +118,13 @@ async function placeOrder(side, type, timeInForce, price, qty = QUANTITY) {
     });
     if (!res.ok) {
         const text = await res.text();
+        // 401 = API key expired — exit gracefully (PM2 should NOT restart)
+        if (res.status === 401) {
+            const msg = "❌ API key expired (401). Update API_KEY in .env and restart manually.";
+            console.error("\n" + msg);
+            await sendTelegram(msg);
+            process.exit(0); // exit(0) = PM2 won't auto-restart
+        }
         throw new Error(`${side} ${type} failed [${res.status}]: ${text}`);
     }
 }
