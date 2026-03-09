@@ -293,6 +293,24 @@ async function placeOrder(
     const text = await res.text();
 
     if (res.status === 401) {
+      console.error("\n" + "=".repeat(60));
+      console.error("❌ 401 Unauthorized — Request details:");
+      console.error("=".repeat(60));
+      console.error(`  URL      : ${BACKEND_URL}/fapi/v1/order`);
+      console.error(`  Method   : POST`);
+      console.error(
+        `  API Key  : ${API_KEY.slice(0, 8)}...${API_KEY.slice(-4)}`,
+      );
+      console.error(`  Symbol   : ${backend} (${pair.symbol})`);
+      console.error(`  Side     : ${side}`);
+      console.error(`  Type     : ${type}`);
+      console.error(`  Price    : ${price ?? "N/A"}`);
+      console.error(`  Quantity : ${qty ?? pair.quantity}`);
+      console.error(`  Body     : ${body}`);
+      console.error("-".repeat(60));
+      console.error(`  Response : ${text}`);
+      console.error("=".repeat(60));
+
       const msg =
         "❌ API key expired (401). Update apiKey in accounts.json and restart.";
       console.error("\n" + msg);
