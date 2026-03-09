@@ -1,269 +1,417 @@
-#!/usr/bin/env bun
 /**
- * Mock Market Maker Script
- * ========================
- * Standalone script simulating market making for demo/testing purposes.
+ * Mock Market Maker — TypeScript
+ * ==============================
+ * Multi-pair market maker for demo/testing purposes.
  *
  * Each cycle (every INTERVAL_MS):
- *   1. GET mark price  →  /fapi/v1/ticker/price
- *   2. DELETE all open orders  →  /fapi/v1/openOrders
- *   3. POST BUY  limit ALO @ markPrice * (1 - SPREAD)   ← post-only bid
- *   4. POST SELL limit ALO @ markPrice * (1 + SPREAD)   ← post-only ask
- *   5. POST BUY  limit GTC @ markPrice (exact)           ┐ cross each
- *   6. POST SELL limit GTC @ markPrice (exact)           ┘ other → fill
+ *   1. Fetch mark price from Binance (or backend for non-standard pairs)
+ *   2. Cancel all open orders
+ *   3. Place BID levels (buy below mark)
+ *   4. Place ASK levels (sell above mark)
+ *   5. Place match orders at mark price → fill each other
  *
  * Setup:
- *   1. Install dependencies (only @noble/ed25519 needed):
- *        bun add @noble/ed25519
- *      OR (npm):
- *        npm install @noble/ed25519
- *
- *   2. Copy .env.example → .env and fill in your values
- *
- *   3. Run:
- *        bun run scripts/market-maker.ts
- *      OR compile and run with node:
- *        npx esbuild scripts/market-maker.ts --bundle --platform=node --outfile=market-maker.js
- *        node market-maker.js
+ *   1. Copy .env.example → .env and fill in your values
+ *   2. npm run build
+ *   3. npm start
  */
 
 import { readFileSync, existsSync } from "node:fs";
-import { join } from "node:path";
+import {
+  createPrivateKey,
+  sign as nodeSign,
+  type KeyObject,
+} from "node:crypto";
 
-// ─── Load .env manually (no dotenv dependency needed) ───────────────────────
-function loadEnv(filepath: string): void {
-    if (!existsSync(filepath)) return;
-    const lines = readFileSync(filepath, "utf8").split("\n");
-    for (const line of lines) {
-        const trimmed = line.trim();
-        if (!trimmed || trimmed.startsWith("#")) continue;
-        const eqIdx = trimmed.indexOf("=");
-        if (eqIdx === -1) continue;
-        const key = trimmed.slice(0, eqIdx).trim();
-        let value = trimmed.slice(eqIdx + 1).trim();
-        // Strip surrounding quotes
-        if ((value.startsWith('"') && value.endsWith('"')) ||
-            (value.startsWith("'") && value.endsWith("'"))) {
-            value = value.slice(1, -1);
-        }
-        if (!(key in process.env)) {
-            process.env[key] = value;
-        }
-    }
+// ─── Types ───────────────────────────────────────────────────────────────────
+
+interface TradingPair {
+  symbol: string;
+  productId: number;
+  spread: number;
+  quantity: number;
 }
 
-// Load .env from script directory or current working directory
-loadEnv(join(new URL(".", import.meta.url).pathname, ".env"));
-loadEnv(join(process.cwd(), ".env"));
+interface PairState {
+  consecutiveErrors: number;
+  disabled: boolean;
+}
 
-// ─── Config ─────────────────────────────────────────────────────────────────
+interface SymbolPair {
+  backend: string;
+  binance: string;
+}
 
-const BACKEND_URL = (process.env.BACKEND_URL ?? "http://47.243.220.53:3000").replace(/\/$/, "");
+interface PriceIndexResponse {
+  markPrice?: string;
+  price?: string;
+}
+
+// ─── Load .env manually (no dotenv dependency needed) ────────────────────────
+
+function loadEnv(filepath: string): void {
+  if (!existsSync(filepath)) return;
+
+  for (const line of readFileSync(filepath, "utf8").split("\n")) {
+    const t = line.trim();
+    if (!t || t.startsWith("#")) continue;
+
+    const eq = t.indexOf("=");
+    if (eq === -1) continue;
+
+    const k = t.slice(0, eq).trim();
+    let v = t.slice(eq + 1).trim();
+
+    // Strip inline comments (e.g. VALUE=foo  # comment → foo)
+    const commentIdx = v.search(/\s+#/);
+    if (commentIdx !== -1) v = v.slice(0, commentIdx).trim();
+
+    // Strip surrounding quotes
+    v = v.replace(/^["']|["']$/g, "");
+
+    if (!(k in process.env)) process.env[k] = v;
+  }
+}
+
+loadEnv(new URL(".env", import.meta.url).pathname);
+
+// ─── Config ──────────────────────────────────────────────────────────────────
+
+const BACKEND_URL = (
+  process.env.BACKEND_URL ?? "http://47.243.220.53:3000"
+).replace(/\/$/, "");
 const API_KEY = process.env.API_KEY ?? "";
-const PRIVATE_KEY_HEX = process.env.PRIVATE_KEY_HEX ?? ""; // 64-char hex string
+const PRIV_HEX = process.env.PRIVATE_KEY_HEX ?? "";
 
-// Trading params
-const SYMBOL = process.env.SYMBOL ?? "BTC-USDC";  // frontend format
-const PRODUCT_ID = parseInt(process.env.PRODUCT_ID ?? "1", 10);
-const SPREAD = parseFloat(process.env.SPREAD ?? "0.001"); // 0.1% per side
-const QUANTITY = process.env.QUANTITY ?? "0.01";       // base amount
+const LEVELS = parseInt(process.env.LEVELS ?? "5", 10);
 const INTERVAL_MS = parseInt(process.env.INTERVAL_MS ?? "30000", 10);
+const MAX_ERRORS = parseInt(process.env.MAX_ERRORS ?? "5", 10);
+
+// Telegram alert (optional)
+const TG_TOKEN = process.env.TELEGRAM_BOT_TOKEN ?? "";
+const TG_CHAT_ID = process.env.TELEGRAM_CHAT_ID ?? "";
+
+const SPREAD = parseFloat(process.env.SPREAD ?? "0.001");
+
+let PAIRS: TradingPair[] = [
+  { symbol: "BTC-USDC", productId: 2, spread: SPREAD, quantity: 0.0123 },
+  { symbol: "ETH-USDC", productId: 4, spread: SPREAD, quantity: 0.2 },
+  { symbol: "SOL-USDC", productId: 5, spread: SPREAD, quantity: 1.5 },
+  { symbol: "0G-USDC", productId: 6, spread: SPREAD, quantity: 100 },
+];
+
+if (process.env.PAIRS_JSON) {
+  try {
+    PAIRS = JSON.parse(process.env.PAIRS_JSON) as TradingPair[];
+  } catch {
+    console.error("❌ Invalid PAIRS_JSON");
+    process.exit(1);
+  }
+}
 
 // ─── Validation ──────────────────────────────────────────────────────────────
 
 if (!API_KEY) {
-    console.error("❌ API_KEY is required. Set it in .env or environment.");
-    process.exit(1);
-}
-if (!PRIVATE_KEY_HEX || PRIVATE_KEY_HEX.length !== 64) {
-    console.error("❌ PRIVATE_KEY_HEX must be a 64-character hex string.");
-    process.exit(1);
+  console.error("❌ API_KEY missing. Set it in .env or environment.");
+  process.exit(1);
 }
 
-// ─── Symbol conversion (BTC-USDC → BTCUSDCPERP, BTC/USDC → BTCUSDC) ────────
-
-function convertToBackendFormat(symbol: string): string {
-    if (symbol.includes("-")) {
-        // Perp: BTC-USDC → BTCUSDCPERP
-        return symbol.replace("-", "") + "PERP";
-    }
-    // Spot: BTC/USDC → BTCUSDC
-    return symbol.replace("/", "");
+if (PRIV_HEX.length !== 64) {
+  console.error("❌ PRIVATE_KEY_HEX must be a 64-character hex string.");
+  process.exit(1);
 }
 
-const BACKEND_SYMBOL = convertToBackendFormat(SYMBOL);
+// ─── Symbol conversion ──────────────────────────────────────────────────────
 
-// ─── Signing utilities ───────────────────────────────────────────────────────
+function getSymbols(symbolStr: string): SymbolPair {
+  const backend = symbolStr.includes("-")
+    ? symbolStr.replace("-", "") + "PERP"
+    : symbolStr.replace("/", "");
 
-let ed: typeof import("@noble/ed25519");
+  // Binance uses USDT, not USDC
+  const binance = backend.replace(/PERP$/, "").replace(/USDC$/, "USDT");
 
-async function getEd() {
-    if (!ed) {
-        ed = await import("@noble/ed25519");
-    }
-    return ed;
+  return { backend, binance };
 }
 
-function hexToBytes(hex: string): Uint8Array {
-    const arr = new Uint8Array(hex.length / 2);
-    for (let i = 0; i < hex.length; i += 2) {
-        arr[i / 2] = parseInt(hex.slice(i, i + 2), 16);
-    }
-    return arr;
+// ─── Signing (node:crypto — synchronous, no external deps) ──────────────────
+
+const PKCS8_HEADER = Buffer.from("302e020100300506032b657004220420", "hex");
+
+let _privateKey: KeyObject | null = null;
+
+function getPrivateKey(): KeyObject {
+  if (!_privateKey) {
+    const seed = Buffer.from(PRIV_HEX, "hex");
+    const pkcs8 = Buffer.concat([PKCS8_HEADER, seed]);
+    _privateKey = createPrivateKey({
+      key: pkcs8,
+      format: "der",
+      type: "pkcs8",
+    });
+  }
+
+  return _privateKey;
 }
 
-function arrayBufferToBase64(buf: ArrayBuffer): string {
-    let binary = "";
-    const bytes = new Uint8Array(buf);
-    for (let i = 0; i < bytes.length; i++) {
-        binary += String.fromCharCode(bytes[i]);
-    }
-    return btoa(binary);
+function sign(message: string): string {
+  const sig = nodeSign(null, Buffer.from(message, "utf8"), getPrivateKey());
+  return sig.toString("base64");
 }
 
-async function signBase64(message: string, privateKeyHex: string): Promise<string> {
-    const lib = await getEd();
-    const privateKey = hexToBytes(privateKeyHex);
-    const msgBytes = new TextEncoder().encode(message);
-    const sig = await lib.signAsync(msgBytes, privateKey);
-    return arrayBufferToBase64(new Uint8Array(sig).buffer);
+function buildQS(
+  params: Record<string, string | number | boolean | undefined>,
+): string {
+  return Object.entries(params)
+    .filter(([, v]) => v !== undefined)
+    .sort(([a], [b]) => a.localeCompare(b))
+    .map(
+      ([k, v]) => `${encodeURIComponent(k)}=${encodeURIComponent(String(v))}`,
+    )
+    .join("&");
 }
 
-function buildQueryString(params: Record<string, string | number | boolean | undefined>): string {
-    return Object.entries(params)
-        .filter(([, v]) => v !== undefined)
-        .sort(([a], [b]) => a.localeCompare(b))
-        .map(([k, v]) => `${encodeURIComponent(k)}=${encodeURIComponent(String(v))}`)
-        .join("&");
-}
-
-async function buildSignedBody(
-    params: Record<string, string | number | boolean | undefined>,
-): Promise<string> {
-    const qs = buildQueryString({ ...params, timestamp: params.timestamp ?? Date.now() });
-    const sig = await signBase64(qs, PRIVATE_KEY_HEX);
-    return `${qs}&signature=${encodeURIComponent(sig)}`;
+function signedBody(
+  params: Record<string, string | number | boolean | undefined>,
+): string {
+  const qs = buildQS({ ...params, timestamp: Date.now() });
+  const sig = sign(qs);
+  return `${qs}&signature=${encodeURIComponent(sig)}`;
 }
 
 // ─── API helpers ─────────────────────────────────────────────────────────────
 
-async function apiFetch(path: string, opts?: RequestInit): Promise<Response> {
-    const url = `${BACKEND_URL}${path}`;
-    const res = await fetch(url, opts);
-    return res;
+async function api(path: string, opts?: RequestInit): Promise<Response> {
+  return fetch(`${BACKEND_URL}${path}`, opts);
 }
 
-async function placeOrder(params: {
-    side: "BUY" | "SELL";
-    type: "LIMIT" | "MARKET";
-    timeInForce?: "GTC" | "IOC" | "ALO";
-    price?: string;
-}): Promise<void> {
-    const body = await buildSignedBody({
-        productId: PRODUCT_ID,
-        symbol: BACKEND_SYMBOL,
-        side: params.side,
-        type: params.type,
-        ...(params.timeInForce ? { timeInForce: params.timeInForce } : {}),
-        quantity: QUANTITY,
-        ...(params.price ? { price: params.price } : {}),
-    });
+async function placeOrder(
+  pair: TradingPair,
+  side: "BUY" | "SELL",
+  type: "LIMIT" | "MARKET",
+  timeInForce?: "GTC" | "IOC" | "ALO",
+  price?: string,
+  qty?: number | string,
+): Promise<void> {
+  const { backend } = getSymbols(pair.symbol);
 
-    const res = await apiFetch("/fapi/v1/order", {
-        method: "POST",
-        headers: {
-            "Content-Type": "application/x-www-form-urlencoded",
-            "x-api-key": API_KEY,
-        },
-        body,
-    });
+  const params: Record<string, string | number | boolean | undefined> = {
+    productId: pair.productId,
+    quantity: qty ?? pair.quantity,
+    side,
+    symbol: backend,
+    type,
+  };
 
-    if (!res.ok) {
-        const text = await res.text();
-        throw new Error(`Order failed [${params.side} ${params.type}]: ${res.status} ${text}`);
+  if (timeInForce) params.timeInForce = timeInForce;
+  if (price) params.price = price;
+
+  const body = signedBody(params);
+  const res = await api("/fapi/v1/order", {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/x-www-form-urlencoded",
+      "x-api-key": API_KEY,
+    },
+    body,
+  });
+
+  if (!res.ok) {
+    const text = await res.text();
+
+    if (res.status === 401) {
+      const msg =
+        "❌ API key expired (401). Update API_KEY in .env and restart manually.";
+      console.error("\n" + msg);
+      await sendTelegram(msg);
+      process.exit(0);
     }
+
+    throw new Error(`${side} ${type} failed [${res.status}]: ${text}`);
+  }
 }
 
-// ─── Main cycle ──────────────────────────────────────────────────────────────
+// ─── Telegram alert ──────────────────────────────────────────────────────────
+
+function nowStr(): string {
+  return new Date().toLocaleString("vi-VN", {
+    timeZone: "Asia/Ho_Chi_Minh",
+    hour12: false,
+  });
+}
+
+async function sendTelegram(msg: string): Promise<void> {
+  if (!TG_TOKEN || !TG_CHAT_ID) return;
+
+  try {
+    await fetch(`https://api.telegram.org/bot${TG_TOKEN}/sendMessage`, {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({
+        chat_id: TG_CHAT_ID,
+        text: `[Market Maker] ${nowStr()}\n${msg}`,
+      }),
+    });
+  } catch {
+    /* ignore Telegram errors */
+  }
+}
+
+// ─── Cycle ───────────────────────────────────────────────────────────────────
 
 let cycleCount = 0;
 
-async function runCycle(): Promise<void> {
-    cycleCount++;
-    const label = `[Cycle #${cycleCount}]`;
-    console.log(`\n${label} ${new Date().toISOString()}`);
+const pairStates: Record<string, PairState> = {};
+PAIRS.forEach(
+  (p) => (pairStates[p.symbol] = { consecutiveErrors: 0, disabled: false }),
+);
 
-    try {
-        // 1. Fetch mark price
-        process.stdout.write(`  1. Fetching mark price... `);
-        const priceRes = await apiFetch(`/fapi/v1/ticker/price?symbol=${BACKEND_SYMBOL}`);
-        if (!priceRes.ok) throw new Error(`Price fetch failed: ${priceRes.status}`);
-        const priceData = await priceRes.json() as { price?: string } | Array<{ price?: string }>;
-        const rawPrice = Array.isArray(priceData) ? priceData[0]?.price : priceData.price;
-        const markPrice = parseFloat(rawPrice ?? "0");
-        if (!markPrice) throw new Error("Invalid mark price received");
-        console.log(`$${markPrice.toFixed(2)}`);
+async function cycleForPair(pair: TradingPair): Promise<void> {
+  const { backend, binance } = getSymbols(pair.symbol);
+  const state = pairStates[pair.symbol];
 
-        // 2. Cancel all open orders
-        process.stdout.write(`  2. Cancelling all open orders... `);
-        const cancelQS = buildQueryString({ symbol: BACKEND_SYMBOL, timestamp: Date.now() });
-        const cancelSig = await signBase64(cancelQS, PRIVATE_KEY_HEX);
-        const cancelRes = await apiFetch(
-            `/fapi/v1/openOrders?${cancelQS}&signature=${encodeURIComponent(cancelSig)}`,
-            { method: "DELETE", headers: { "x-api-key": API_KEY } },
-        );
-        console.log(cancelRes.ok ? "done" : `skipped (${cancelRes.status})`);
+  if (state.disabled) return;
 
-        // 3. Post-only BID (buy below mark)
-        const bidPrice = (markPrice * (1 - SPREAD)).toFixed(2);
-        process.stdout.write(`  3. BID @ ${bidPrice} (ALO)... `);
-        await placeOrder({ side: "BUY", type: "LIMIT", timeInForce: "ALO", price: bidPrice });
-        console.log("placed");
+  try {
+    let markPrice: number | undefined;
 
-        // 4. Post-only ASK (sell above mark)
-        const askPrice = (markPrice * (1 + SPREAD)).toFixed(2);
-        process.stdout.write(`  4. ASK @ ${askPrice} (ALO)... `);
-        await placeOrder({ side: "SELL", type: "LIMIT", timeInForce: "ALO", price: askPrice });
-        console.log("placed");
+    process.stdout.write(`  [${pair.symbol}] Mark price... `);
 
-        // 5. Match: limit BUY @ markPrice
-        const matchPrice = markPrice.toFixed(2);
-        process.stdout.write(`  5. Match BUY  @ ${matchPrice} (GTC)... `);
-        await placeOrder({ side: "BUY", type: "LIMIT", timeInForce: "GTC", price: matchPrice });
-        console.log("placed");
+    if (pair.symbol === "0G-USDC") {
+      // 0G is not on Binance — fetch from backend or use fallback
+      const beRes = await fetch(
+        `${BACKEND_URL}/fapi/v1/premiumIndex?symbol=${backend}`,
+      );
 
-        // 6. Match: limit SELL @ markPrice (crosses with #5 → fill)
-        process.stdout.write(`  6. Match SELL @ ${matchPrice} (GTC)... `);
-        await placeOrder({ side: "SELL", type: "LIMIT", timeInForce: "GTC", price: matchPrice });
-        console.log("placed");
+      if (beRes.ok) {
+        const data = (await beRes.json()) as
+          | PriceIndexResponse
+          | PriceIndexResponse[];
+        const item = Array.isArray(data) ? data[0] : data;
+        if (item?.markPrice) markPrice = parseFloat(item.markPrice);
+      }
 
-        console.log(`  ✓ Cycle complete. Next in ${INTERVAL_MS / 1000}s.`);
-    } catch (err) {
-        console.error(`  ✗ Error:`, err instanceof Error ? err.message : err);
+      if (!markPrice) markPrice = 0.04; // fallback
+    } else {
+      const binanceRes = await fetch(
+        `https://fapi.binance.com/fapi/v1/premiumIndex?symbol=${binance}`,
+      );
+
+      if (!binanceRes.ok) throw new Error(`Binance API: ${binanceRes.status}`);
+
+      const binanceData = (await binanceRes.json()) as PriceIndexResponse;
+      markPrice = parseFloat(binanceData.markPrice ?? "0");
     }
+
+    if (!markPrice) throw new Error(`Invalid markPrice for ${pair.symbol}`);
+
+    console.log(`$${markPrice.toFixed(4)}`);
+
+    // Cancel all open orders
+    process.stdout.write(`  [${pair.symbol}] Cancel orders... `);
+    const cancelBody = signedBody({ symbol: backend });
+    const cancelRes = await api("/fapi/v1/openOrders", {
+      method: "DELETE",
+      headers: {
+        "Content-Type": "application/x-www-form-urlencoded",
+        "x-api-key": API_KEY,
+      },
+      body: cancelBody,
+    });
+    console.log(cancelRes.ok ? "done" : `skipped (${cancelRes.status})`);
+
+    // BID levels
+    for (let i = 1; i <= LEVELS; i++) {
+      const bid = (markPrice * (1 - pair.spread * i)).toFixed(4);
+      const qty = (pair.quantity * (1 + (i - 1) * 0.5)).toFixed(4);
+      process.stdout.write(
+        `  [${pair.symbol}] BID[${i}] @ ${bid} qty:${qty}... `,
+      );
+      await placeOrder(pair, "BUY", "LIMIT", "GTC", bid, qty);
+      console.log("placed");
+    }
+
+    // ASK levels
+    for (let i = 1; i <= LEVELS; i++) {
+      const ask = (markPrice * (1 + pair.spread * i)).toFixed(4);
+      const qty = (pair.quantity * (1 + (i - 1) * 0.5)).toFixed(4);
+      process.stdout.write(
+        `  [${pair.symbol}] ASK[${i}] @ ${ask} qty:${qty}... `,
+      );
+      await placeOrder(pair, "SELL", "LIMIT", "GTC", ask, qty);
+      console.log("placed");
+    }
+
+    // Match orders at mark price
+    const mpStr = markPrice.toFixed(4);
+
+    process.stdout.write(`  [${pair.symbol}] Match BUY  @ ${mpStr} (GTC)... `);
+    await placeOrder(pair, "BUY", "LIMIT", "GTC", mpStr, pair.quantity);
+    console.log("placed");
+
+    process.stdout.write(`  [${pair.symbol}] Match SELL @ ${mpStr} (GTC)... `);
+    await placeOrder(pair, "SELL", "LIMIT", "GTC", mpStr, pair.quantity);
+    console.log("placed");
+
+    state.consecutiveErrors = 0;
+  } catch (err) {
+    state.consecutiveErrors++;
+    const errorMsg = err instanceof Error ? err.message : String(err);
+    const msg = `[${pair.symbol}] Cycle #${cycleCount} error (${state.consecutiveErrors}/${MAX_ERRORS}): ${errorMsg}`;
+    console.error(`  ✗ ${msg}`);
+    await sendTelegram(`⚠️ ${msg}`);
+
+    if (state.consecutiveErrors >= MAX_ERRORS) {
+      const fatal = `[${pair.symbol}] Stopping after ${MAX_ERRORS} errors. Last: ${errorMsg}`;
+      console.error(`\n❌ ${fatal}`);
+      await sendTelegram(`🛑 ${fatal}`);
+      state.disabled = true;
+    }
+  }
+}
+
+async function cycleAll(): Promise<void> {
+  cycleCount++;
+  const timeStr = new Date().toLocaleString("vi-VN", {
+    timeZone: "Asia/Ho_Chi_Minh",
+    hour12: false,
+  });
+  console.log(`\n[Cycle #${cycleCount}] ${timeStr}`);
+
+  await Promise.allSettled(PAIRS.map(cycleForPair));
+  console.log(`  ✓ All pairs finished. Next in ${INTERVAL_MS / 1000}s`);
 }
 
 // ─── Entry point ─────────────────────────────────────────────────────────────
 
-console.log("=".repeat(55));
-console.log("  Mock Market Maker");
-console.log("=".repeat(55));
-console.log(`  Backend  : ${BACKEND_URL}`);
-console.log(`  Symbol   : ${SYMBOL} → ${BACKEND_SYMBOL}`);
-console.log(`  Spread   : ±${(SPREAD * 100).toFixed(2)}%`);
-console.log(`  Quantity : ${QUANTITY}`);
-console.log(`  Interval : ${INTERVAL_MS / 1000}s`);
-console.log(`  API Key  : ${API_KEY.slice(0, 8)}...`);
-console.log("=".repeat(55));
-console.log("Press Ctrl+C to stop.\n");
+console.log("=".repeat(50));
+console.log("  Mock Market Maker (Multi-Pairs)");
+console.log("=".repeat(50));
+console.log(`  Backend    : ${BACKEND_URL}`);
+console.log(`  Pairs      : ${PAIRS.map((p) => p.symbol).join(", ")}`);
+console.log(`  Levels     : ${LEVELS}`);
+console.log(`  Interval   : ${INTERVAL_MS / 1000}s`);
+console.log(
+  `  Max errors : ${MAX_ERRORS}  |  Telegram: ${TG_TOKEN ? "✓" : "✗"}`,
+);
+console.log("=".repeat(50));
+console.log("Ctrl+C to stop\n");
 
-// Run immediately, then repeat
-await runCycle();
-const timer = setInterval(runCycle, INTERVAL_MS);
+// Verify signing works before starting
+try {
+  sign("test");
+  console.log("✓ Signing OK\n");
+} catch (err) {
+  const msg = err instanceof Error ? err.message : String(err);
+  console.error("❌ Signing failed:", msg);
+  process.exit(1);
+}
 
-// Graceful shutdown
+await cycleAll();
+const timer = setInterval(cycleAll, INTERVAL_MS);
+
 process.on("SIGINT", () => {
-    clearInterval(timer);
-    console.log("\n\nStopped. Goodbye!");
-    process.exit(0);
+  clearInterval(timer);
+  console.log("\nStopped.");
+  process.exit(0);
 });

@@ -1,0 +1,24 @@
+{
+    "name": "mock-market-maker",
+    "version": "1.0.0",
+    "description": "Mock Market Maker — multi-pair bot that places bid/ask orders and creates trade matches",
+    "type": "module",
+    "scripts": {
+        "build": "npx esbuild market-maker.ts --bundle --platform=node --format=esm --outfile=dist/market-maker.mjs",
+        "start": "node dist/market-maker.mjs",
+        "dev": "npx tsx market-maker.ts",
+        "typecheck": "tsc --noEmit",
+        "pm2:start": "pm2 start ecosystem.config.cjs",
+        "pm2:stop": "pm2 stop market-maker",
+        "pm2:logs": "pm2 logs market-maker",
+        "pm2:status": "pm2 status"
+    },
+    "devDependencies": {
+        "@types/node": "^22.15.3",
+        "typescript": "^5.8.3"
+    },
+    "engines": {
+        "node": ">=18"
+    },
+    "private": true
+}
