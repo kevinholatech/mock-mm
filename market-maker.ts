@@ -165,7 +165,7 @@ const SPREAD = parseFloat(process.env.SPREAD ?? "0.001");
 let PAIRS: TradingPair[] = [
   { symbol: "BTC-USDC", productId: 2, spread: SPREAD, quantity: 0.0123 },
   { symbol: "ETH-USDC", productId: 4, spread: SPREAD, quantity: 0.2 },
-  { symbol: "SOL-USDC", productId: 5, spread: SPREAD, quantity: 1.5 },
+  // { symbol: "SOL-USDC", productId: 5, spread: SPREAD, quantity: 1.5 },
   { symbol: "0G-USDC", productId: 6, spread: SPREAD, quantity: 100 },
 ];
 
