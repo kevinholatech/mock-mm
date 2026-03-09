@@ -1,0 +1,16 @@
+[
+  {
+    "name": "mm-78F5",
+    "apiKey": "your-api-key-here",
+    "privateKeyHex": "your-64-char-hex-private-key-here",
+    "updatedAt": 1741484400000,
+    "pairs": null
+  },
+  {
+    "name": "mm-A3B1",
+    "apiKey": "your-api-key-here",
+    "privateKeyHex": "your-64-char-hex-private-key-here",
+    "updatedAt": 1741484400000,
+    "pairs": null
+  }
+]

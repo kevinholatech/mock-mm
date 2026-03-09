@@ -47,6 +47,14 @@ interface PriceIndexResponse {
   price?: string;
 }
 
+interface AccountConfig {
+  name: string;
+  apiKey: string;
+  privateKeyHex: string;
+  updatedAt?: number;
+  pairs?: TradingPair[] | null;
+}
+
 // ─── Load .env manually (no dotenv dependency needed) ────────────────────────
 
 function loadEnv(filepath: string): void {
@@ -73,15 +81,76 @@ function loadEnv(filepath: string): void {
   }
 }
 
-loadEnv(new URL(".env", import.meta.url).pathname);
+const resolve = (file: string): string =>
+  new URL(file, `file://${process.cwd()}/`).pathname;
+
+loadEnv(resolve(".env"));
+
+// ─── Account loading (multi-account support) ─────────────────────────────────
+
+function deduplicateAccounts(accounts: AccountConfig[]): AccountConfig[] {
+  const map = new Map<string, AccountConfig>();
+
+  for (const acc of accounts) {
+    const existing = map.get(acc.name);
+
+    if (!existing || (acc.updatedAt ?? 0) > (existing.updatedAt ?? 0)) {
+      map.set(acc.name, acc);
+    }
+  }
+
+  return Array.from(map.values());
+}
+
+function loadAccounts(): AccountConfig[] {
+  const configPath = resolve("accounts.json");
+
+  if (!existsSync(configPath)) {
+    console.error(
+      "❌ accounts.json not found. Copy from accounts.json.example",
+    );
+    process.exit(1);
+  }
+
+  const raw = JSON.parse(readFileSync(configPath, "utf8")) as AccountConfig[];
+
+  return deduplicateAccounts(raw);
+}
+
+function loadAccount(): AccountConfig {
+  const nameArg = process.argv.find((a) => a.startsWith("--account-name="));
+
+  if (!nameArg) {
+    console.error("❌ Missing --account-name argument.");
+    console.error("   Usage: node market-maker.mjs --account-name=mm-78F5");
+    console.error("   Or use PM2: pm2 start ecosystem.config.cjs");
+    process.exit(1);
+  }
+
+  const name = nameArg.split("=")[1];
+  const accounts = loadAccounts();
+  const found = accounts.find((a) => a.name === name);
+
+  if (!found) {
+    console.error(
+      `❌ Account "${name}" not found. Available: ${accounts.map((a) => a.name).join(", ")}`,
+    );
+    process.exit(1);
+  }
+
+  return found;
+}
 
 // ─── Config ──────────────────────────────────────────────────────────────────
+
+const account = loadAccount();
+const ACCOUNT_NAME = account.name;
 
 const BACKEND_URL = (
   process.env.BACKEND_URL ?? "http://47.243.220.53:3000"
 ).replace(/\/$/, "");
-const API_KEY = process.env.API_KEY ?? "";
-const PRIV_HEX = process.env.PRIVATE_KEY_HEX ?? "";
+const API_KEY = account.apiKey;
+const PRIV_HEX = account.privateKeyHex;
 
 const LEVELS = parseInt(process.env.LEVELS ?? "5", 10);
 const INTERVAL_MS = parseInt(process.env.INTERVAL_MS ?? "30000", 10);
@@ -100,7 +169,9 @@ let PAIRS: TradingPair[] = [
   { symbol: "0G-USDC", productId: 6, spread: SPREAD, quantity: 100 },
 ];
 
-if (process.env.PAIRS_JSON) {
+if (account.pairs) {
+  PAIRS = account.pairs;
+} else if (process.env.PAIRS_JSON) {
   try {
     PAIRS = JSON.parse(process.env.PAIRS_JSON) as TradingPair[];
   } catch {
@@ -112,12 +183,14 @@ if (process.env.PAIRS_JSON) {
 // ─── Validation ──────────────────────────────────────────────────────────────
 
 if (!API_KEY) {
-  console.error("❌ API_KEY missing. Set it in .env or environment.");
+  console.error(`❌ [${ACCOUNT_NAME}] apiKey is empty in accounts.json`);
   process.exit(1);
 }
 
 if (PRIV_HEX.length !== 64) {
-  console.error("❌ PRIVATE_KEY_HEX must be a 64-character hex string.");
+  console.error(
+    `❌ [${ACCOUNT_NAME}] privateKeyHex must be a 64-character hex string.`,
+  );
   process.exit(1);
 }
 
@@ -221,7 +294,7 @@ async function placeOrder(
 
     if (res.status === 401) {
       const msg =
-        "❌ API key expired (401). Update API_KEY in .env and restart manually.";
+        "❌ API key expired (401). Update apiKey in accounts.json and restart.";
       console.error("\n" + msg);
       await sendTelegram(msg);
       process.exit(0);
@@ -249,7 +322,7 @@ async function sendTelegram(msg: string): Promise<void> {
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
         chat_id: TG_CHAT_ID,
-        text: `[Market Maker] ${nowStr()}\n${msg}`,
+        text: `[MM:${ACCOUNT_NAME}] ${nowStr()}\n${msg}`,
       }),
     });
   } catch {
@@ -376,7 +449,7 @@ async function cycleAll(): Promise<void> {
     timeZone: "Asia/Ho_Chi_Minh",
     hour12: false,
   });
-  console.log(`\n[Cycle #${cycleCount}] ${timeStr}`);
+  console.log(`\n[${ACCOUNT_NAME}] [Cycle #${cycleCount}] ${timeStr}`);
 
   await Promise.allSettled(PAIRS.map(cycleForPair));
   console.log(`  ✓ All pairs finished. Next in ${INTERVAL_MS / 1000}s`);
@@ -384,9 +457,10 @@ async function cycleAll(): Promise<void> {
 
 // ─── Entry point ─────────────────────────────────────────────────────────────
 
-console.log("=".repeat(50));
+console.log("=".repeat(55));
 console.log("  Mock Market Maker (Multi-Pairs)");
-console.log("=".repeat(50));
+console.log("=".repeat(55));
+console.log(`  Account    : ${ACCOUNT_NAME}`);
 console.log(`  Backend    : ${BACKEND_URL}`);
 console.log(`  Pairs      : ${PAIRS.map((p) => p.symbol).join(", ")}`);
 console.log(`  Levels     : ${LEVELS}`);
@@ -394,7 +468,7 @@ console.log(`  Interval   : ${INTERVAL_MS / 1000}s`);
 console.log(
   `  Max errors : ${MAX_ERRORS}  |  Telegram: ${TG_TOKEN ? "✓" : "✗"}`,
 );
-console.log("=".repeat(50));
+console.log("=".repeat(55));
 console.log("Ctrl+C to stop\n");
 
 // Verify signing works before starting
