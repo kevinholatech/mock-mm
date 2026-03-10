@@ -279,6 +279,7 @@ async function placeOrder(
   if (timeInForce) params.timeInForce = timeInForce;
   if (price) params.price = price;
 
+  const now = Date.now();
   const body = signedBody(params);
   const res = await api("/fapi/v1/order", {
     method: "POST",
@@ -293,29 +294,32 @@ async function placeOrder(
     const text = await res.text();
 
     if (res.status === 401) {
+      const tsLocal = new Date(now).toISOString();
+
       console.error("\n" + "=".repeat(60));
       console.error("❌ 401 Unauthorized — Request details:");
       console.error("=".repeat(60));
-      console.error(`  URL      : ${BACKEND_URL}/fapi/v1/order`);
-      console.error(`  Method   : POST`);
+      console.error(`  URL       : ${BACKEND_URL}/fapi/v1/order`);
+      console.error(`  Method    : POST`);
       console.error(
-        `  API Key  : ${API_KEY.slice(0, 8)}...${API_KEY.slice(-4)}`,
+        `  API Key   : ${API_KEY.slice(0, 8)}...${API_KEY.slice(-4)}`,
       );
-      console.error(`  Symbol   : ${backend} (${pair.symbol})`);
-      console.error(`  Side     : ${side}`);
-      console.error(`  Type     : ${type}`);
-      console.error(`  Price    : ${price ?? "N/A"}`);
-      console.error(`  Quantity : ${qty ?? pair.quantity}`);
-      console.error(`  Body     : ${body}`);
+      console.error(`  Timestamp : ${now} (${tsLocal})`);
+      console.error(`  Symbol    : ${backend} (${pair.symbol})`);
+      console.error(`  Side      : ${side}`);
+      console.error(`  Type      : ${type}`);
+      console.error(`  Price     : ${price ?? "N/A"}`);
+      console.error(`  Quantity  : ${qty ?? pair.quantity}`);
+      console.error(`  Body      : ${body}`);
       console.error("-".repeat(60));
-      console.error(`  Response : ${text}`);
+      console.error(`  Response  : ${text}`);
       console.error("=".repeat(60));
 
-      const msg =
-        "❌ API key expired (401). Update apiKey in accounts.json and restart.";
-      console.error("\n" + msg);
-      await sendTelegram(msg);
-      process.exit(0);
+      await sendTelegram(
+        `❌ 401 on ${pair.symbol} ${side}. Response: ${text.slice(0, 200)}`,
+      );
+
+      throw new Error(`401 Unauthorized: ${text}`);
     }
 
     throw new Error(`${side} ${type} failed [${res.status}]: ${text}`);
@@ -325,10 +329,7 @@ async function placeOrder(
 // ─── Telegram alert ──────────────────────────────────────────────────────────
 
 function nowStr(): string {
-  return new Date().toLocaleString("vi-VN", {
-    timeZone: "Asia/Ho_Chi_Minh",
-    hour12: false,
-  });
+  return new Date().toISOString();
 }
 
 async function sendTelegram(msg: string): Promise<void> {
@@ -463,10 +464,7 @@ async function cycleForPair(pair: TradingPair): Promise<void> {
 
 async function cycleAll(): Promise<void> {
   cycleCount++;
-  const timeStr = new Date().toLocaleString("vi-VN", {
-    timeZone: "Asia/Ho_Chi_Minh",
-    hour12: false,
-  });
+  const timeStr = new Date().toISOString();
   console.log(`\n[${ACCOUNT_NAME}] [Cycle #${cycleCount}] ${timeStr}`);
 
   await Promise.allSettled(PAIRS.map(cycleForPair));
